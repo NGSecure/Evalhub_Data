@@ -1,0 +1,46 @@
+The Sleuth Kit's NTFS file-system driver (built for AFL/ASan fuzzing through the `fls` NTFS
+harness) crashes with a wild-pointer SEGV read while simply opening a crafted NTFS volume, well
+before any file-listing logic runs: the fault surfaces from inside the volume-open path, in the
+step that loads the volume's cluster-allocation bitmap ($Bitmap) at mount time.
+
+Root cause: loading $Bitmap starts by reading its MFT record into a fixed-size buffer sized to the
+volume's declared MFT-record length, then locating that record's non-resident $DATA attribute and
+taking the attribute's raw "run list" -- the on-disk encoding of (length, offset) pairs describing
+which physical clusters back the bitmap file. The run list's *starting* position inside the MFT
+record is computed from a 16-bit "run offset" field read straight out of the (attacker-controlled)
+MFT record with no check that it actually lands inside the record buffer, but that alone doesn't
+explain a wild-address crash on a freshly allocated buffer of only about 1KB -- the deeper problem
+is what happens once parsing begins there.
+
+The run-list decoding loop walks that buffer entry by entry with no notion of "end of buffer" at
+all: each entry starts with one packed byte whose two nibbles say how many bytes encode the run's
+length and how many encode its offset; the decoder reads that many length bytes and that many
+offset bytes, then advances its cursor by (1 + length-byte-count + offset-byte-count) to reach the
+next entry, purely by walking pointers forward through memory -- the loop's only termination
+condition is "the next entry's packed size byte reads as zero." Nothing in this loop ever compares
+the advancing cursor against the size of the buffer it was handed (that buffer's length is never
+even passed into the decoding routine in the first place). A crafted volume can therefore encode a
+run list whose entries all keep reporting a non-zero size byte, chaining the cursor forward past the
+end of the small heap allocation one attacker-chosen stride at a time for as long as the crafted
+bytes keep supplying non-zero size nibbles. Because each stride can be several dozen bytes and there
+is no cap on how many entries get walked, the cursor can end up well beyond the original allocation
+before the next read of an entry's own size byte lands on genuinely unmapped memory -- producing the
+SEGV / wild-address read AddressSanitizer reports here, rather than a small, redzone-caught
+heap-buffer-overflow.
+
+fix_commit plausibility: NO. `fix_files` lists only two Java sources under the project's Java
+data-model bindings (the Autopsy case-database JDBC layer) -- code that implements prepared-statement
+bookkeeping for the case SQLite/PostgreSQL database, which has nothing to do with parsing on-disk
+NTFS structures and cannot even execute in this C/C++ AFL harness's crash path. Reading `patch.diff`
+confirms this directly: the actual changes add statement-type tracking (distinguishing SELECT from
+INSERT) and a closed-statement guard to a JDBC prepared-statement wrapper class, purely a Java
+case-database API change, unrelated to NTFS parsing or memory safety. This matches this project's
+known recurring fix_commit-misattribution pattern, where the recorded fix commit points at the Java
+bindings tree instead of the native filesystem code that actually produced the crash. Diffing the
+vulnerable and patched native source trees directly (`src-vul.tar.gz` vs `src-fix.tar.gz`) shows
+where the real upstream fix lives instead: the NTFS run-list decoder gains an explicit size-bound
+parameter (derived from the attribute's own declared length), the loop condition is changed to also
+require the cursor to stay under that bound, and the length/offset nibble sizes are further checked
+against the remaining budget before each read -- i.e. the real native-code fix directly closes the
+missing-bounds-check walk described above. `fix_commit` should be treated as misattributed for this
+task.
