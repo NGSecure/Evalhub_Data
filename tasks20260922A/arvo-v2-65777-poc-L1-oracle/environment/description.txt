@@ -1,0 +1,69 @@
+Project: qpdf (PDF parsing/manipulation library)
+Sanitizer: AddressSanitizer
+Crash type: heap-use-after-free, READ of 8 bytes
+
+Summary
+-------
+A malformed PDF that lacks a valid header and a usable cross-reference (xref)
+table forces qpdf into its xref-reconstruction fallback. During reconstruction
+qpdf scans the file for object definitions and inserts an entry into its
+in-memory xref table (a std::map keyed by object-generation pair,
+QPDFObjGen -> QPDFXRefEntry) for every object number it discovers. Because the
+scanner does not validate the sign/range of the parsed object numbers, a
+crafted input can get an entry with a non-positive object number (e.g. object
+id -1) inserted into that map. The 8-byte use-after-free read is of such a map
+node's key after the node has already been freed.
+
+Mechanism (root cause)
+----------------------
+After reconstruction, the xref reader runs a de-duplication pass whose intent
+is "for any object number, keep only the highest generation." It walks the
+sorted map once, remembering the previous key in a sentinel variable that is
+initialized to object id -1 (last_og{-1,0}); whenever the current entry's
+object id equals the remembered object id, it calls removeObject() on the
+remembered key, which erases that key from the very same map being iterated.
+
+The flaw: the sentinel's object id (-1) is a value that a crafted file can
+actually place into the map as a real entry. Since the map is sorted, an entry
+with object id -1 is the first element visited. On the first iteration the
+current entry's id (-1) matches the sentinel's id (-1), so removeObject() erases
+the map node that the range-based for loop's iterator is currently pointing at.
+The next statement then assigns "previous = current.first", reading the object
+key out of the node that was just freed by the erase -> heap-use-after-free
+READ of the 8-byte QPDGObjGen key. (Confirmed by the free stack: the freed
+region is a map tree node deallocated inside removeObject() via map::erase,
+originally allocated when the reconstruction pass inserted the entry via the
+map's operator[].) More generally the sentinel-collision (and erasing during
+iteration for bogus non-positive object numbers) is the defect; a negative/zero
+object id should never have been treated as a normal object at all.
+
+Direction / details
+-------------------
+- Access: READ (not write), size 8 (the QPDFObjGen {int obj, int gen} key).
+- Freed by: map::erase inside removeObject(), called from the de-dup pass.
+- Allocated by: map operator[] during xref reconstruction
+  (insertReconstructedXrefEntry).
+- Same-thread T0 alloc/free/use; classic iterate-and-erase-current-node UAF,
+  triggered specifically by a non-positive (sentinel-colliding) object number.
+
+Patch
+-----
+The fix adds a guard so the de-dup pass only calls removeObject() when the
+object id is strictly greater than 0 (the loop condition becomes
+"current id == previous id AND current id > 0"). This prevents the sentinel
+value -1 (and any other non-positive object id) from ever matching and
+erasing the node being iterated, eliminating the use-after-free. A sibling
+hunk hardens a related routine that walks candidate objects, replacing an
+isIndirect() test with an explicit "object id > 0" check so non-positive
+object ids are likewise rejected rather than processed. The rest of the commit
+just adds the reproducing fuzz corpus inputs and bumps the fuzz test count.
+
+fix_commit judgment
+-------------------
+fix_commit 6e3b7982dbcf8087374694253e0e248fbc6c6e3e matches this crash.
+Concrete reasons: the crash occurs in the xref-reading routine at the exact
+statement that assigns the previous key right after the conditional
+removeObject() call, and the commit edits precisely that loop (adding the
+"id > 0" guard and renaming the loop variable) in the same source file; it
+also adds the object 65777 fuzz input to the corpus. The edited de-dup loop is
+the direct site of the use-after-free, so the fix is correctly attributed.
