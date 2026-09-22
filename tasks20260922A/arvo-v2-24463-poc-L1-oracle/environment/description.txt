@@ -1,0 +1,44 @@
+A malformed/truncated OpenGEX (Open Game Engine Exchange, ".ogex") scene file makes
+assimp's embedded OpenDDL text-format parser read one byte past the end of the
+heap-allocated input buffer while it is scanning a bare-word token (an object-type
+name / identifier that appears right after a structure-opening brace in the OpenDDL
+grammar), causing an ASan heap-buffer-overflow READ of size 1.
+
+Root cause: OpenDDL parsing works over a raw `char*` cursor pair (`in`, `end`) copied
+out of a `std::vector<char>` that was resized to exactly the byte length of the input
+file — so `end` sits exactly one byte past the last valid, addressable buffer byte,
+with nothing beyond it. The loop that scans a bare-word token advances `in` while a
+chain of boolean tests all say "keep going": not a separator character, not a newline,
+not one of a few structural punctuation characters. That boolean chain evaluates its
+content-inspecting tests (which dereference `*in`) *before* it checks whether the
+cursor has already reached `end`. For ordinary inputs this is harmless, because the
+token is followed by a separator/newline/punctuation byte that is still inside the
+buffer, so the loop exits on a content test before `in` ever reaches `end`. But when
+the input is degenerate/truncated so that the token run extends all the way to the
+very last byte of the file with no terminating separator, newline, or structural
+character before end-of-file, the cursor is advanced to exactly `end` and the loop
+re-enters: it dereferences `*in` to answer the separator/newline/punctuation tests
+*before* the "cursor != end" bounds test ever gets a chance to short-circuit the
+chain, reading one byte past the tail of the (very small, single-digit-byte) heap
+allocation backing the parse buffer. This is a boolean-short-circuit-ordering bug,
+not a missing check: the bounds test exists in the source, it is just placed last in
+the `&&` chain instead of first, so it never gets evaluated before the
+already-out-of-bounds dereference happens.
+
+fix_commit assessment: the patch is credible for this exact crash. It reorders the
+identifier/bare-word scanning loop's boolean chain so the "cursor != end" bounds test
+is evaluated first (short-circuiting the loop before any `*in` dereference once the
+cursor is at end) — precisely the pattern needed to prevent this crash's one-byte
+over-read. The same commit applies the identical reordering fix to several sibling
+call sites in the same recursive-descent parser (the structure-header token parser
+that calls into bare-word scanning, and the property-list parser that structure
+headers can recurse into), plus adds equivalent end-of-buffer guards to a
+buffer-normalization comment-stripping loop and hardens a character-classification
+table lookup against out-of-range byte values. Only the bare-word/identifier-scanning
+site is on this crash's actual call stack (structure-header parsing -> name parsing ->
+bare-word/identifier scanning), so the other sites in the same commit fix
+closely-related but distinct over-read opportunities in the same parser rather than
+this specific reported crash — but the crash address (one byte past the very small
+heap allocation backing the parse buffer) and the crash site match this fix's
+identifier-scanning reordering exactly, so fix_commit is trustworthy as the fix for
+this bug.
