@@ -1,0 +1,28 @@
+Summary: In the libssh2 SSH client, handling of an incoming SSH_MSG_CHANNEL_OPEN request for the
+"auth-agent@openssh.com" (agent-forwarding) channel type triggers a 1-byte heap-buffer-overflow READ
+when the received packet is only just long enough to pass the caller's coarse length check but too
+short to hold all three 32-bit fields (sender channel, initial window size, packet size) that the
+per-channel-type open handler unconditionally parses out of it.
+
+Root cause: the dispatcher that recognizes the channel-open-request payload only verifies that the
+packet is at least as long as the fixed header plus the channel-type name string before invoking the
+type-specific open handler. That handler then computes a fixed byte offset past the channel-type name
+and reads three consecutive big-endian 32-bit integers from that point onward without any further
+bounds check against the actual received length. For a packet whose total length lands exactly on
+(or just past) the dispatcher's minimum threshold, the offset already consumes nearly the whole
+buffer, so converting the first 32-bit value reads one byte beyond the end of the heap allocation that
+holds the packet data (a 31-byte buffer in the crashing input, with the out-of-bounds read landing
+exactly at the byte immediately following it). This is a read-only over-read (no write), and the
+value being read (the sender-channel field) is what overflows the allocation by one byte — the
+buffer/allocation size does not grow or shrink; it is the parser's assumed offset that outgrows the
+actual data available.
+
+fix_commit assessment: fix_commit matches the crash. The associated patch reworks exactly this
+channel-open handler (and its counterparts for the other channel-open subtypes) to stop using blind
+pointer arithmetic for these integer reads. It introduces an explicit check that the remaining data
+length is at least as large as the computed name-based offset before touching the buffer, and then
+replaces each of the three raw big-endian reads with a bounds-checked accessor that itself validates
+enough bytes remain before extracting each 32-bit value and advancing, returning an error instead of
+reading out of range otherwise. This directly closes the gap between the dispatcher's coarse
+length check and the number of bytes the handler actually consumes, which is the exact mismatch that
+produced the over-read in the crashing trace.

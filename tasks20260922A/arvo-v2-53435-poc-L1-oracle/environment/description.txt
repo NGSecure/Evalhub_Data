@@ -1,0 +1,25 @@
+Summary: A lossless (predictive) mode JPEG image processed by the libjpeg-turbo
+decompressor triggers a wild-address read crash (SIGSEGV) because the lossless
+Huffman entropy decoder calls through an uninitialized function pointer when the
+entropy-coded input is exhausted before the scan finishes.
+
+Root cause: While decoding a lossless JPEG scan, the Huffman entropy decoder has
+an "out of input data" branch: it zeroes its output difference rows and then, to
+reset predictor state, invokes a "prediction restart" method stored in the
+lossless decompressor object (that object is reached by reinterpreting the
+inverse-DCT / codec pointer as the lossless-decompressor struct). This
+method-pointer field is declared in the lossless decompressor struct but is
+never assigned by any initialization or per-pass routine, so it holds an
+indeterminate value. The indirect call therefore transfers control to a garbage
+high address, and AddressSanitizer reports a SEGV caused by a read at that wild
+address (SCARINESS 20, wild-addr-read). A truncated or crafted lossless JPEG
+that forces the decoder into this out-of-data branch reliably reaches the bad
+call.
+
+What the fix addresses: the patch removes the dead, never-initialized
+function-pointer field from the lossless decompressor struct entirely and
+rewrites both of its call sites to instead call the lossless decompressor's
+properly assigned start-of-pass reset routine. After the fix, the out-of-data
+branch resets predictor/decoder state through a valid, initialized pointer, so
+the exhausted-input path no longer performs an indirect call through
+uninitialized memory.
