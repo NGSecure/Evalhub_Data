@@ -1,0 +1,70 @@
+Summary
+=======
+A heap buffer overflow (out-of-bounds WRITE) is triggered while HTML is parsed
+by the tidy-html5 library. The overflow happens inside the routine that grows
+the parser's internal node-pointer stack, during the memcpy that migrates the
+existing entries into a freshly allocated, but undersized, buffer.
+
+Where it happens
+================
+The tidy parser keeps a dynamically growing stack of node pointers (an array of
+`Node *`). While cleaning/whitespace-handling document content, the parser pushes
+nodes onto this stack. When the stack is full, a "grow" helper is invoked that is
+supposed to double the stack's capacity by allocating a larger backing array and
+copying the current contents over.
+
+Root cause (re-derived)
+=======================
+The grow helper computes the new capacity as the old capacity doubled:
+
+    new_capacity = capacity * 2;   /* this is an ELEMENT count */
+
+but it then allocates only `new_capacity` BYTES for the new array of pointers:
+
+    firstNode = TidyAlloc(allocator, new_capacity);        /* buggy */
+
+The element-size factor is missing. Each slot is a `Node *` (8 bytes on a 64-bit
+build), so the buffer is undersized by a factor of sizeof(Node*). Immediately
+afterward the helper copies the live entries out of the old array:
+
+    memcpy(firstNode, old, sizeof(Node*) * (top + 1));
+
+`sizeof(Node*) * (top + 1)` bytes are written into a buffer that only holds
+`new_capacity` bytes, so the write runs off the right-hand end of the freshly
+allocated region.
+
+Concretely matching the crash: at the failing call the doubled capacity is 32,
+so exactly 32 bytes are malloc'd (ASan reports a 32-byte region). The stack was
+full at that point (top + 1 == 16 entries), so the memcpy attempts to write
+16 * 8 = 128 bytes. ASan reports "WRITE of size 128" landing 0 bytes to the right
+of the 32-byte region — i.e. an overflow of 96 bytes past the end of the
+destination allocation. The correct allocation size is
+new_capacity * sizeof(Node*) = 32 * 8 = 256 bytes, which comfortably holds the
+128 copied bytes.
+
+Direction: this is a WRITE overflow of the destination (copy target), growing
+past the end of the heap allocation; the defective variable is the allocation
+size passed to the allocator (too small), not the copy length.
+
+Reachability
+============
+Any parsed input long/nested enough to push more than the stack's initial
+capacity of node pointers forces the grow helper to run, so a moderately sized
+HTML document with enough whitespace/content nodes to fill and overflow the
+initial stack is sufficient to reach the buggy allocation and trigger the
+out-of-bounds copy.
+
+Fix
+===
+The fix multiplies the allocation size by the element size when growing the
+stack:
+
+    firstNode = TidyAlloc(allocator, new_capacity * sizeof(Node*));
+
+This makes the backing array large enough for `new_capacity` pointer entries, so
+the subsequent memcpy of the existing `(top + 1)` pointers stays in bounds. The
+fixing commit's change to the grow routine is a precise, minimal correction of
+exactly the missing sizeof-multiplier that causes this crash, so the fix commit
+clearly matches the finding. (The same commit also bundles several unrelated
+NULL-guard hardening edits in other modules; those are incidental and do not bear
+on this overflow.)

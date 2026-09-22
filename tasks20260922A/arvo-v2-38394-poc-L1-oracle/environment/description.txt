@@ -1,0 +1,15 @@
+Project: stb (single-header image loading library), exercised through the stbi_read_fuzzer harness that calls stbi_load_from_memory on attacker-controlled bytes.
+
+Vulnerability class: heap-buffer-overflow, a 2-byte out-of-bounds READ (AddressSanitizer, SCARINESS 14). The read lands exactly 0 bytes past the end of a 16-byte heap allocation, i.e. one 16-bit element beyond the buffer.
+
+Trigger path and mechanism:
+The crashing input is a PNM (PGM/PPM) image whose header declares a 16-bit-per-channel maxval. The PNM decode path allocates a raw pixel buffer sized correctly for the true bit depth (img_n * x * y * 2 bytes for 16-bit samples) and fills it. The bug appears in the subsequent channel-count conversion step that runs when the caller requests a different number of channels than the file provides (req_comp != img_n).
+
+In the vulnerable code the PNM loader unconditionally used the 8-bit-per-channel format-conversion helper for this channel remap. That helper allocates its destination buffer as req_comp * x * y bytes — i.e. it assumes one byte per sample — and returns that undersized buffer. Because the decoded data is actually 16-bit, the top-level 8-bit load routine then invokes the 16-bit-to-8-bit downconversion pass on that buffer, iterating over req_comp * x * y sixteen-bit elements and reading 2 bytes each. Since the buffer only holds req_comp * x * y *bytes*, the downconversion walks off the end, reading two bytes just past the 16-byte region. So the root cause is a bit-depth/allocation-size mismatch: a 16-bit image funneled through an 8-bit-only conversion path, producing a destination buffer half the size the later 16-bit consumer expects.
+
+Direction check: the overflow is a READ (not a write), of size 2 (a 16-bit sample), occurring at the right edge of the source buffer during downconversion. The buffer is *too small* because it was sized for 8-bit samples while the data is 16-bit.
+
+Fix analysis:
+The fix commit teaches the PNM loader to choose the conversion helper by bit depth: when bits_per_channel == 16 it calls the dedicated 16-bit-aware format converter (which allocates and steps over 2-byte samples), otherwise it uses the 8-bit converter as before. That removes the size mismatch that caused the out-of-bounds read, so the differential (crash on vul, clean on fix) is directly explained. The same commit also hardens two adjacent, unrelated conditions in the PNM/HDR readers — it now checks the return value of the raw-pixel read and errors out on a truncated PNM file, and it rejects a zero-length RLE run in the HDR decoder. Those are defensive additions bundled into the commit but are not what triggers this particular finding.
+
+fix_commit judgment: the fix_commit matches the crash. The bit-depth-dispatch change in the PNM channel-conversion path precisely eliminates the undersized-buffer / 16-bit-read overflow described above; the extra checks in the same commit are hardening and do not contradict this attribution.
