@@ -63,4 +63,10 @@ rm -rf "$BUNDLE/environment/oracle"
 # --- 6. per-bundle run scripts (build.sh = public net, push.sh = upload net) ----
 bash "$HERE/gen_scripts.sh" "$BUNDLE" "$VER"
 
-echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh; oracle/ removed"
+# --- 7. normalize instruction.md (drop shared placeholder, prepend fixed PoC
+#        preamble unless a similar instruction is already present) ------------
+if [ -f "$BUNDLE/instruction.md" ]; then
+  python3 "$HERE/normalize_instruction.py" "$BUNDLE/instruction.md"
+fi
+
+echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh, instruction.md; oracle/ removed"
