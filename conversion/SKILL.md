@@ -63,6 +63,7 @@ contract and its images built locally and pushed to SWR.
 | `tests/test.sh` -> `oracle:8000/grade` `X-Oracle-Token` | -> `task-server:9111/verify` `X-Submission-Token` + `tests/verify.py` | AUTH_TOKEN must match the compose |
 | `solution/solve.sh` | **unchanged** | it writes /workspace/poc directly; new test.sh reads that via fallback |
 | `task.toml` `[environment]` (no images) | `+ docker_image` `+ task_server_image` | filled by `newplatform push --task-toml` |
+| `task.toml` `[agent]` network_mode/allowed_hosts | **removed** | platform injects network policy externally; bundles must not declare it |
 | `instruction.md` (leading shared-placeholder comment) | fixed PoC-task preamble prepended, placeholder dropped | see **instruction.md preamble** below |
 
 **Token:** reuse the bundle's own `ORACLE_TOKEN` (from the prime compose) as the

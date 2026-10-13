@@ -69,4 +69,12 @@ if [ -f "$BUNDLE/instruction.md" ]; then
   python3 "$HERE/normalize_instruction.py" "$BUNDLE/instruction.md"
 fi
 
-echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh, instruction.md; oracle/ removed"
+# --- 8. drop [agent] network policy from task.toml --------------------------
+# The new platform injects network policy externally, so a converted bundle must
+# not declare network_mode/allowed_hosts in [agent] (it keeps only timeout_sec).
+# Section-scoped and idempotent; a prime bundle that lacks the block is a no-op.
+if [ -f "$BUNDLE/task.toml" ]; then
+  python3 "$HERE/strip_agent_net.py" "$BUNDLE/task.toml"
+fi
+
+echo "  done: task-server/, docker-compose.yaml, submit.sh, tests/{test.sh,verify.py}, build.sh, push.sh, instruction.md, task.toml([agent] net stripped); oracle/ removed"
